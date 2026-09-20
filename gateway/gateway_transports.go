@@ -193,6 +193,9 @@ func (t *zstdStreamTransport) Close() error {
 	t.buffer.Reset()
 	if t.inflator != nil {
 		t.inflator.Close()
+		// Clear it so a later ReceiveMessage creates a new decoder instead of reusing this one
+		// and failing with "decoder used after Close" for the life of the transport.
+		t.inflator = nil
 	}
 	return connClose
 }
@@ -259,6 +262,8 @@ func (t *zlibStreamTransport) Close() error {
 	t.buffer.Reset()
 	if t.inflator != nil {
 		_ = t.inflator.Close()
+		// Same as the zstd transport: a closed reader must not be reused.
+		t.inflator = nil
 	}
 	return connClose
 }
