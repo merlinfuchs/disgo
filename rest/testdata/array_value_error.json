@@ -1,0 +1,14 @@
+{
+  "code": 50035,
+  "message": "Invalid Form Body",
+  "errors": {
+    "components": {
+      "0": [
+        {
+          "code": "COMPONENT_LAYOUT_WIDTH_EXCEEDED",
+          "message": "The specified component layout is too wide."
+        }
+      ]
+    }
+  }
+}
