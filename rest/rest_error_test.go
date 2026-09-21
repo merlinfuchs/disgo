@@ -34,6 +34,21 @@ func TestError_Error(t *testing.T) {
 			TestFile: "other_error.json",
 			Expected: "50035: Invalid Form Body\ndata -> components -> BASE_TYPE_MAX_LENGTH: Must be 5 or fewer in length.",
 		},
+		{
+			Name:     "array value error",
+			TestFile: "array_value_error.json",
+			Expected: "50035: Invalid Form Body\ncomponents -> 0 -> 0 -> code: COMPONENT_LAYOUT_WIDTH_EXCEEDED\ncomponents -> 0 -> 0 -> message: The specified component layout is too wide.",
+		},
+		{
+			Name:     "scalar value error",
+			TestFile: "scalar_value_error.json",
+			Expected: "50035: Invalid Form Body\ncomponents: Invalid component payload",
+		},
+		{
+			Name:     "scalar _errors list error",
+			TestFile: "scalar_errors_list_error.json",
+			Expected: "50035: Invalid Form Body\ncomponents -> BASE_TYPE_REQUIRED",
+		},
 	}
 
 	for _, d := range data {

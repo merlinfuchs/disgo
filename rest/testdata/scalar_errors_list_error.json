@@ -1,0 +1,9 @@
+{
+  "code": 50035,
+  "message": "Invalid Form Body",
+  "errors": {
+    "components": {
+      "_errors": ["BASE_TYPE_REQUIRED"]
+    }
+  }
+}

@@ -375,24 +375,55 @@ func printErrors(errors json.RawMessage) string {
 
 func parseErrors(prefix string, err map[string]any) string {
 	if errs, ok := err["_errors"]; ok {
-		var s []string
-		for _, e := range errs.([]any) {
-			m := e.(map[string]any)
-			s = append(s, fmt.Sprintf("%s -> %s: %s", prefix, m["code"], m["message"]))
-		}
-		return strings.Join(s, "\n")
+		return parseErrorList(prefix, errs)
 	}
 
 	var s []string
 	for _, k := range slices.Sorted(maps.Keys(err)) {
-		m := err[k].(map[string]any)
-
 		nextPrefix := prefix
 		if nextPrefix != "" {
 			nextPrefix += " -> "
 		}
+		nextPrefix += k
 
-		s = append(s, parseErrors(nextPrefix+k, m))
+		s = append(s, parseErrorValue(nextPrefix, err[k]))
+	}
+
+	return strings.Join(s, "\n")
+}
+
+// parseErrorValue walks whatever the API put at prefix. Discord documents the error tree as
+// nested objects bottoming out in _errors, but it does send bare arrays and scalars in
+// practice, so every branch here has to be reachable rather than asserted away.
+func parseErrorValue(prefix string, v any) string {
+	switch t := v.(type) {
+	case map[string]any:
+		return parseErrors(prefix, t)
+	case []any:
+		var s []string
+		for i, e := range t {
+			s = append(s, parseErrorValue(fmt.Sprintf("%s -> %d", prefix, i), e))
+		}
+		return strings.Join(s, "\n")
+	default:
+		return fmt.Sprintf("%s: %v", prefix, v)
+	}
+}
+
+func parseErrorList(prefix string, errs any) string {
+	list, ok := errs.([]any)
+	if !ok {
+		return parseErrorValue(prefix, errs)
+	}
+
+	var s []string
+	for _, e := range list {
+		m, ok := e.(map[string]any)
+		if !ok {
+			s = append(s, fmt.Sprintf("%s -> %v", prefix, e))
+			continue
+		}
+		s = append(s, fmt.Sprintf("%s -> %s: %s", prefix, m["code"], m["message"]))
 	}
 
 	return strings.Join(s, "\n")
