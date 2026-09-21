@@ -57,7 +57,8 @@ type rateLimiterImpl struct {
 	config rateLimiterConfig
 
 	// global Rate Limit
-	global time.Time
+	globalMu sync.Mutex
+	global   time.Time
 
 	// Hash + Major Parameter -> bucket
 	buckets   map[string]*bucket
@@ -66,6 +67,31 @@ type rateLimiterImpl struct {
 
 func (l *rateLimiterImpl) MaxRetries() int {
 	return l.config.MaxRetries
+}
+
+func (l *rateLimiterImpl) globalReset() time.Time {
+	l.globalMu.Lock()
+	defer l.globalMu.Unlock()
+	return l.global
+}
+
+func (l *rateLimiterImpl) setGlobalReset(reset time.Time) {
+	l.globalMu.Lock()
+	defer l.globalMu.Unlock()
+	l.global = reset
+}
+
+// waitUntil returns the time at which the next request on this bucket may be sent. The global rate
+// limit applies on top of the per bucket one, so whichever resets later wins.
+func (l *rateLimiterImpl) waitUntil(b *bucket, now time.Time) time.Time {
+	var until time.Time
+	if b.Remaining == 0 && b.Reset.After(now) {
+		until = b.Reset
+	}
+	if global := l.globalReset(); global.After(until) {
+		until = global
+	}
+	return until
 }
 
 func (l *rateLimiterImpl) cleanup() {
@@ -113,7 +139,7 @@ func (l *rateLimiterImpl) Reset() {
 	l.bucketsMu.Lock()
 	defer l.bucketsMu.Unlock()
 
-	l.global = time.Time{}
+	l.setGlobalReset(time.Time{})
 	clear(l.buckets)
 }
 
@@ -158,14 +184,8 @@ func (l *rateLimiterImpl) Wait(ctx context.Context, endpoint *CompiledEndpoint) 
 		return err
 	}
 
-	var until time.Time
 	now := time.Now()
-
-	if b.Remaining == 0 && b.Reset.After(now) {
-		until = b.Reset
-	} else {
-		until = l.global
-	}
+	until := l.waitUntil(b, now)
 
 	if until.After(now) {
 		// TODO: do we want to return early when we know the rate limit bigger than ctx deadline?
@@ -214,21 +234,21 @@ func (l *rateLimiterImpl) Unlock(endpoint *CompiledEndpoint, rs *http.Response) 
 	// out on a missing one, otherwise the global rate limit is never recorded and the client
 	// retries straight back into it.
 	if rs.StatusCode == http.StatusTooManyRequests {
-		retryAfter, err := strconv.Atoi(retryAfterHeader)
+		retryAfter, err := strconv.ParseFloat(retryAfterHeader, 64)
 		if err != nil {
 			return fmt.Errorf("invalid retryAfter %s: %w", retryAfterHeader, err)
 		}
-		reset := time.Now().Add(time.Second * time.Duration(retryAfter))
+		reset := time.Now().Add(time.Duration(retryAfter * float64(time.Second)))
 		if global {
-			l.global = reset
-			l.config.Logger.Warn("global rate limit exceeded", slog.Int("retry_after", retryAfter))
+			l.setGlobalReset(reset)
+			l.config.Logger.Warn("global rate limit exceeded", slog.Float64("retry_after", retryAfter))
 		} else if cloudflare {
-			l.global = reset
-			l.config.Logger.Warn("cloudflare rate limit exceeded", slog.Int("retry_after", retryAfter))
+			l.setGlobalReset(reset)
+			l.config.Logger.Warn("cloudflare rate limit exceeded", slog.Float64("retry_after", retryAfter))
 		} else {
 			b.Remaining = 0
 			b.Reset = reset
-			l.config.Logger.Warn("rate limit exceeded", slog.String("endpoint", endpoint.URL), slog.Int("retry_after", retryAfter))
+			l.config.Logger.Warn("rate limit exceeded", slog.String("endpoint", endpoint.URL), slog.Float64("retry_after", retryAfter))
 		}
 		return nil
 	}
