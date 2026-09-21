@@ -17,6 +17,8 @@ const (
 	MaxRetries = 10
 	// CleanupInterval is the interval at which the rate limiter cleans up old buckets
 	CleanupInterval = time.Second * 10
+	// defaultRetryAfter is how long we back off for when a rate limited response doesn't tell us
+	defaultRetryAfter = time.Second
 )
 
 // RateLimiter can be used to supply your own rate limit implementation
@@ -57,7 +59,8 @@ type rateLimiterImpl struct {
 	config rateLimiterConfig
 
 	// global Rate Limit
-	global time.Time
+	globalMu sync.Mutex
+	global   time.Time
 
 	// Hash + Major Parameter -> bucket
 	buckets   map[string]*bucket
@@ -66,6 +69,66 @@ type rateLimiterImpl struct {
 
 func (l *rateLimiterImpl) MaxRetries() int {
 	return l.config.MaxRetries
+}
+
+func (l *rateLimiterImpl) globalReset() time.Time {
+	l.globalMu.Lock()
+	defer l.globalMu.Unlock()
+	return l.global
+}
+
+// setGlobalReset extends the global rate limit, it never shortens it. Requests already in flight
+// when the limit trips come back over the following seconds with a counting down Retry-After, and
+// the shortest of those must not be allowed to end a ban an earlier one set.
+func (l *rateLimiterImpl) setGlobalReset(reset time.Time) {
+	l.globalMu.Lock()
+	defer l.globalMu.Unlock()
+	if reset.After(l.global) {
+		l.global = reset
+	}
+}
+
+func (l *rateLimiterImpl) clearGlobalReset() {
+	l.globalMu.Lock()
+	defer l.globalMu.Unlock()
+	l.global = time.Time{}
+}
+
+// retryAfter is how long to back off for after a rate limited response. Retry-After should always
+// be there, but an edge error page or a proxy can return a 429 without one, and turning a throttle
+// into a permanent failure is worse than waiting a little too long.
+func (l *rateLimiterImpl) retryAfter(headers ...string) time.Duration {
+	for _, header := range headers {
+		if header == "" {
+			continue
+		}
+		seconds, err := strconv.ParseFloat(header, 64)
+		if err != nil {
+			l.config.Logger.Warn("invalid retry after header", slog.String("value", header))
+			continue
+		}
+		return secondsToDuration(seconds)
+	}
+	return defaultRetryAfter
+}
+
+// secondsToDuration converts a header value in seconds to a Duration. Retry-After and
+// X-RateLimit-Reset-After both carry decimals, so the multiply has to happen before the cast.
+func secondsToDuration(seconds float64) time.Duration {
+	return time.Duration(seconds * float64(time.Second))
+}
+
+// waitUntil returns the time at which the next request on this bucket may be sent. The global rate
+// limit applies on top of the per bucket one, so whichever resets later wins.
+func waitUntil(b *bucket, globalReset time.Time, now time.Time) time.Time {
+	var until time.Time
+	if b.Remaining == 0 && b.Reset.After(now) {
+		until = b.Reset
+	}
+	if globalReset.After(until) {
+		until = globalReset
+	}
+	return until
 }
 
 func (l *rateLimiterImpl) cleanup() {
@@ -113,7 +176,7 @@ func (l *rateLimiterImpl) Reset() {
 	l.bucketsMu.Lock()
 	defer l.bucketsMu.Unlock()
 
-	l.global = time.Time{}
+	l.clearGlobalReset()
 	clear(l.buckets)
 }
 
@@ -158,14 +221,8 @@ func (l *rateLimiterImpl) Wait(ctx context.Context, endpoint *CompiledEndpoint) 
 		return err
 	}
 
-	var until time.Time
 	now := time.Now()
-
-	if b.Remaining == 0 && b.Reset.After(now) {
-		until = b.Reset
-	} else {
-		until = l.global
-	}
+	until := waitUntil(b, l.globalReset(), now)
 
 	if until.After(now) {
 		// TODO: do we want to return early when we know the rate limit bigger than ctx deadline?
@@ -198,17 +255,12 @@ func (l *rateLimiterImpl) Unlock(endpoint *CompiledEndpoint, rs *http.Response) 
 	if rs == nil || rs.Header == nil {
 		return nil
 	}
-	bucketHeader := rs.Header.Get("X-RateLimit-Bucket")
-
-	// if we don't have a bucket header, we can't update anything
-	if bucketHeader == "" {
-		return nil
-	}
-
-	b.ID = bucketHeader
-
 	global := rs.Header.Get("X-RateLimit-Global") != ""
-	cloudflare := rs.Header.Get("via") == ""
+	bucketHeader := rs.Header.Get("X-RateLimit-Bucket")
+	// a cloudflare ban never reaches discord, so it carries neither of these. the bucket header is
+	// positive proof the response came from discord's own limiter, and it has to win over the
+	// absence of via, which a proxy in front of the api drops for reasons of its own.
+	cloudflare := bucketHeader == "" && rs.Header.Get("via") == ""
 	remainingHeader := rs.Header.Get("X-RateLimit-Remaining")
 	limitHeader := rs.Header.Get("X-RateLimit-Limit")
 	resetHeader := rs.Header.Get("X-RateLimit-Reset")
@@ -217,24 +269,30 @@ func (l *rateLimiterImpl) Unlock(endpoint *CompiledEndpoint, rs *http.Response) 
 
 	l.config.Logger.Debug("ratelimit response headers", slog.Int("code", rs.StatusCode), slog.Bool("global", global), slog.Bool("cloudflare", cloudflare), slog.String("remaining", remainingHeader), slog.String("limit", limitHeader), slog.String("reset", resetHeader), slog.String("reset_after", resetAfterHeader), slog.String("retry_after", retryAfterHeader))
 
-	// we hit a rate limit. let's see if it was global cloudflare or a route specific one
+	if bucketHeader != "" {
+		b.ID = bucketHeader
+	}
+
+	// we hit a rate limit. let's see if it was a global/cloudflare one or a route specific one.
+	// global and cloudflare responses carry no bucket header, so this runs before the bucket
+	// header check below.
 	if rs.StatusCode == http.StatusTooManyRequests {
-		retryAfter, err := strconv.Atoi(retryAfterHeader)
-		if err != nil {
-			return fmt.Errorf("invalid retryAfter %s: %w", retryAfterHeader, err)
-		}
-		reset := time.Now().Add(time.Second * time.Duration(retryAfter))
-		if global {
-			l.global = reset
-			l.config.Logger.Warn("global rate limit exceeded", slog.Int("retry_after", retryAfter))
-		} else if cloudflare {
-			l.global = reset
-			l.config.Logger.Warn("cloudflare rate limit exceeded", slog.Int("retry_after", retryAfter))
+		retryAfter := l.retryAfter(retryAfterHeader, resetAfterHeader)
+		reset := time.Now().Add(retryAfter)
+
+		if global || cloudflare {
+			l.setGlobalReset(reset)
+			l.config.Logger.Warn("global rate limit exceeded", slog.Bool("cloudflare", cloudflare), slog.Duration("retry_after", retryAfter))
 		} else {
 			b.Remaining = 0
 			b.Reset = reset
-			l.config.Logger.Warn("rate limit exceeded", slog.String("endpoint", endpoint.URL), slog.Int("retry_after", retryAfter))
+			l.config.Logger.Warn("rate limit exceeded", slog.String("endpoint", endpoint.URL), slog.Duration("retry_after", retryAfter))
 		}
+		return nil
+	}
+
+	// if we don't have a bucket header, we can't update anything
+	if bucketHeader == "" {
 		return nil
 	}
 
@@ -261,7 +319,7 @@ func (l *rateLimiterImpl) Unlock(endpoint *CompiledEndpoint, rs *http.Response) 
 			return fmt.Errorf("invalid reset after %s: %w", resetAfterHeader, err)
 		}
 
-		b.Reset = time.Now().Add(time.Duration(resetAfter) * time.Second)
+		b.Reset = time.Now().Add(secondsToDuration(resetAfter))
 	} else if resetHeader != "" {
 		reset, err := strconv.ParseFloat(resetHeader, 64)
 		if err != nil {
