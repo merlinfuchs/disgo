@@ -198,17 +198,9 @@ func (l *rateLimiterImpl) Unlock(endpoint *CompiledEndpoint, rs *http.Response) 
 	if rs == nil || rs.Header == nil {
 		return nil
 	}
-	bucketHeader := rs.Header.Get("X-RateLimit-Bucket")
-
-	// if we don't have a bucket header, we can't update anything
-	if bucketHeader == "" {
-		return nil
-	}
-
-	b.ID = bucketHeader
-
 	global := rs.Header.Get("X-RateLimit-Global") != ""
 	cloudflare := rs.Header.Get("via") == ""
+	bucketHeader := rs.Header.Get("X-RateLimit-Bucket")
 	remainingHeader := rs.Header.Get("X-RateLimit-Remaining")
 	limitHeader := rs.Header.Get("X-RateLimit-Limit")
 	resetHeader := rs.Header.Get("X-RateLimit-Reset")
@@ -217,7 +209,10 @@ func (l *rateLimiterImpl) Unlock(endpoint *CompiledEndpoint, rs *http.Response) 
 
 	l.config.Logger.Debug("ratelimit response headers", slog.Int("code", rs.StatusCode), slog.Bool("global", global), slog.Bool("cloudflare", cloudflare), slog.String("remaining", remainingHeader), slog.String("limit", limitHeader), slog.String("reset", resetHeader), slog.String("reset_after", resetAfterHeader), slog.String("retry_after", retryAfterHeader))
 
-	// we hit a rate limit. let's see if it was global cloudflare or a route specific one
+	// we hit a rate limit. let's see if it was global cloudflare or a route specific one.
+	// global and cloudflare responses carry no bucket header, so this has to run before we bail
+	// out on a missing one, otherwise the global rate limit is never recorded and the client
+	// retries straight back into it.
 	if rs.StatusCode == http.StatusTooManyRequests {
 		retryAfter, err := strconv.Atoi(retryAfterHeader)
 		if err != nil {
@@ -237,6 +232,13 @@ func (l *rateLimiterImpl) Unlock(endpoint *CompiledEndpoint, rs *http.Response) 
 		}
 		return nil
 	}
+
+	// if we don't have a bucket header, we can't update anything
+	if bucketHeader == "" {
+		return nil
+	}
+
+	b.ID = bucketHeader
 
 	if limitHeader != "" {
 		limit, err := strconv.Atoi(limitHeader)
