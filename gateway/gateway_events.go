@@ -31,6 +31,15 @@ func (e *EventUnknown) UnmarshalJSON(data []byte) error {
 func (EventUnknown) messageData() {}
 func (EventUnknown) eventData()   {}
 
+// EventInvalid is a dispatch event disgo failed to decode. It is logged and dropped instead of being passed to event handlers.
+type EventInvalid struct {
+	Err  error
+	Data json.RawMessage
+}
+
+func (EventInvalid) messageData() {}
+func (EventInvalid) eventData()   {}
+
 // EventReady is the event sent by discord when you successfully Identify
 type EventReady struct {
 	Version          int                        `json:"v"`

@@ -670,6 +670,11 @@ func (g *gatewayImpl) listen(conn transport, ready func(error)) {
 				})
 			}
 
+			if invalidEvent, ok := eventData.(EventInvalid); ok {
+				g.config.Logger.Error("failed to decode gateway event, dropping it", slog.String("event", string(message.T)), slog.Int("seq", message.S), slog.Any("err", invalidEvent.Err))
+				continue
+			}
+
 			if unknownEvent, ok := eventData.(EventUnknown); ok {
 				g.config.Logger.Debug("unknown event received", slog.String("event", string(message.T)), slog.String("data", string(unknownEvent)))
 				continue
