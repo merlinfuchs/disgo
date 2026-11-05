@@ -39,6 +39,12 @@ func (e *Message) UnmarshalJSON(data []byte) error {
 	switch v.Op {
 	case OpcodeDispatch:
 		messageData, err = UnmarshalEventData(v.D, v.T)
+		// Failing here makes the gateway reconnect and Discord resend the same event, which loops.
+		// READY is still fatal because the session can't start without it.
+		if err != nil && v.T != EventTypeReady {
+			messageData = EventInvalid{Err: err, Data: v.D}
+			err = nil
+		}
 
 	case OpcodeHeartbeat:
 		var d MessageDataHeartbeat
