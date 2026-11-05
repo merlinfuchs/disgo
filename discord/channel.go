@@ -222,7 +222,9 @@ func (u *UnmarshalChannel) UnmarshalJSON(data []byte) error {
 		channel = v
 
 	default:
-		err = fmt.Errorf("unknown channel with type %d received", cType.Type)
+		var v UnknownChannel
+		err = json.Unmarshal(data, &v)
+		channel = v
 	}
 
 	if err != nil {
@@ -232,6 +234,97 @@ func (u *UnmarshalChannel) UnmarshalJSON(data []byte) error {
 	u.Channel = channel
 	return nil
 }
+
+var (
+	_ Channel      = (*UnknownChannel)(nil)
+	_ GuildChannel = (*UnknownChannel)(nil)
+)
+
+// UnknownChannel is a channel with a type disgo doesn't support yet.
+// It implements GuildChannel so a new channel type in a guild doesn't break decoding the guild.
+// Data holds the original payload, which MarshalJSON returns unchanged.
+type UnknownChannel struct {
+	id                   snowflake.ID
+	channelType          ChannelType
+	guildID              snowflake.ID
+	position             int
+	parentID             *snowflake.ID
+	permissionOverwrites PermissionOverwrites
+	name                 string
+	Data                 json.RawMessage
+}
+
+func (c *UnknownChannel) UnmarshalJSON(data []byte) error {
+	var v struct {
+		ID                   snowflake.ID                   `json:"id"`
+		Type                 ChannelType                    `json:"type"`
+		GuildID              snowflake.ID                   `json:"guild_id"`
+		Position             int                            `json:"position"`
+		ParentID             *snowflake.ID                  `json:"parent_id"`
+		PermissionOverwrites []UnmarshalPermissionOverwrite `json:"permission_overwrites"`
+		Name                 string                         `json:"name"`
+	}
+	if err := json.Unmarshal(data, &v); err != nil {
+		return err
+	}
+
+	c.id = v.ID
+	c.channelType = v.Type
+	c.guildID = v.GuildID
+	c.position = v.Position
+	c.parentID = v.ParentID
+	c.permissionOverwrites = parsePermissionOverwrites(v.PermissionOverwrites)
+	c.name = v.Name
+	c.Data = append(json.RawMessage(nil), data...)
+	return nil
+}
+
+func (c UnknownChannel) MarshalJSON() ([]byte, error) {
+	return c.Data, nil
+}
+
+func (c UnknownChannel) String() string {
+	return channelString(c)
+}
+
+func (c UnknownChannel) Mention() string {
+	return ChannelMention(c.ID())
+}
+
+func (c UnknownChannel) Type() ChannelType {
+	return c.channelType
+}
+
+func (c UnknownChannel) ID() snowflake.ID {
+	return c.id
+}
+
+func (c UnknownChannel) Name() string {
+	return c.name
+}
+
+func (c UnknownChannel) GuildID() snowflake.ID {
+	return c.guildID
+}
+
+func (c UnknownChannel) PermissionOverwrites() PermissionOverwrites {
+	return c.permissionOverwrites
+}
+
+func (c UnknownChannel) Position() int {
+	return c.position
+}
+
+func (c UnknownChannel) ParentID() *snowflake.ID {
+	return c.parentID
+}
+
+func (c UnknownChannel) CreatedAt() time.Time {
+	return c.id.Time()
+}
+
+func (UnknownChannel) channel()      {}
+func (UnknownChannel) guildChannel() {}
 
 var (
 	_ Channel             = (*GuildTextChannel)(nil)
@@ -1480,6 +1573,9 @@ func ApplyGuildIDToChannel(channel GuildChannel, guildID snowflake.ID) GuildChan
 		c.guildID = guildID
 		return c
 	case GuildMediaChannel:
+		c.guildID = guildID
+		return c
+	case UnknownChannel:
 		c.guildID = guildID
 		return c
 	default:
